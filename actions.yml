@@ -1,0 +1,129 @@
+name: 'Terraform plan and/or apply'
+description: 'Runs Terraform plan and/or apply based on flags'
+
+inputs:
+  terraform_aws_assumed_role_arn:
+    description: 'AWS Role ARN assumed by Terraform'
+    required: true
+  one_password_service_account_token:
+    description: 'One password service account token'
+    required: true
+  terraform_state_postgres_db_name:
+    description: 'Name of Postgres database where Terraform state lives'
+    required: true
+  github_token:
+    description: 'secrets.GITHUB_TOKEN'
+    required: true
+  trigger_terraform_plan:
+    description: 'trigger Terraform plan step'
+    default: true
+    required: false
+  trigger_terraform_apply:
+    description: 'trigger Terraform apply step'
+    default: false
+    required: false
+    
+runs:
+  using: "composite"
+  steps:
+    - name: Checkout the repository to the runner
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials from Test account
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ inputs.terraform_aws_assumed_role_arn }}
+        aws-region: us-east-1
+          
+    - name: Setup Terraform with specified version on the runner
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_version: 1.6.5
+
+    - name: Setup PostGres creds with 1Password
+      id: op-load-postgres-secret
+      uses: 1password/load-secrets-action@v1
+      with:
+        export-env: true
+      env:
+        OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+        PGUSER: ${{ secrets.OP_POSTGRES_VAULT_ITEM }}/username
+        PGPASSWORD: ${{ secrets.OP_POSTGRES_VAULT_ITEM }}/password
+        PGHOST: ${{ secrets.OP_POSTGRES_VAULT_ITEM }}/server
+
+    - name: Postgres - create database
+      id: postgres-createdb
+      run: createdb ${{ inputs.terraform_state_postgres_db_name }}
+      continue-on-error: true
+        
+    - name: Terraform init
+      id: init
+      run: terraform init
+
+    - name: Terraform format
+      id: fmt
+      run: terraform fmt -check
+
+    - name: Terraform validate
+      id: validate
+      run: terraform validate
+
+    - name: Terraform plan
+      id: plan
+      if: inputs.trigger_terraform_plan == 'true'
+      run: terraform plan -no-color -input=false
+      continue-on-error: true
+
+    - name: Update PR
+      uses: actions/github-script@v6
+      if: inputs.trigger_terraform_plan == 'true'
+      id: plan-comment
+      env:
+        PLAN: "terraform\n${{ steps.plan.outputs.stdout }}"
+      with:
+        github-token: ${{ inputs.github_token }}
+        script: |
+          // 1. Retrieve existing bot comments for the PR
+          const { data: comments } = await github.rest.issues.listComments({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+          });
+          const botComment = comments.find(comment => {
+            return comment.user.type === 'Bot' && comment.body.includes('Terraform Format and Style')
+          });
+          const output = `#### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
+          #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+          #### Terraform Validation 🤖\`${{ steps.validate.outcome }}\`
+          #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
+          
+          <details><summary>Show Plan</summary>
+          
+          \`\`\`\n
+          ${process.env.PLAN}
+          \`\`\`
+          
+          </details>
+          *Pushed by: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+          // 3. Delete previous comment so PR timeline makes sense
+          if (botComment) {
+            github.rest.issues.deleteComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: botComment.id,
+            });
+          }
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: output
+          });
+
+    - name: Terraform Plan Status
+      if: steps.plan.outcome == 'failure'
+      run: exit 1
+
+    - name: Terraform Apply
+      if: inputs.trigger_terraform_apply == 'true'
+      run: terraform apply -auto-approve -input=false
